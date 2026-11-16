@@ -1,0 +1,10 @@
+services:
+  vip_bot:
+    build: .
+    container_name: vip_sub_bot
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./vip_bot.db:/app/vip_bot.db
