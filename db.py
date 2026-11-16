@@ -129,6 +129,13 @@ def init_db(db_path: Optional[str] = None) -> None:
                 UNIQUE(chat_id, code)
             );
 
+            CREATE TABLE IF NOT EXISTS receipt_messages (
+                authority TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                PRIMARY KEY (authority, chat_id, message_id)
+            );
+
             CREATE TABLE IF NOT EXISTS promo_uses (
                 promo_id INTEGER NOT NULL,
                 user_id INTEGER NOT NULL,
@@ -759,6 +766,21 @@ def mark_payment_submitted(
         row = conn.execute("SELECT * FROM payments WHERE authority = ?", (authority,)).fetchone()
         return dict(row) if row else None
 
+def track_receipt_message(authority: str, chat_id: int, message_id: int, db_path: Optional[str] = None) -> None:
+    with get_conn(db_path) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO receipt_messages (authority, chat_id, message_id) VALUES (?, ?, ?)",
+            (authority, chat_id, message_id)
+        )
+
+def get_receipt_messages(authority: str, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT chat_id, message_id FROM receipt_messages WHERE authority = ?",
+            (authority,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
 def mark_payment_rejected(authority: str, expected_owner_id: Optional[int] = None, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
     with get_conn(db_path) as conn:
         if expected_owner_id is not None:
@@ -768,16 +790,19 @@ def mark_payment_rejected(authority: str, expected_owner_id: Optional[int] = Non
             ).fetchone()
             if not owner_check or owner_check["owner_id"] != expected_owner_id:
                 return None
-        conn.execute("UPDATE payments SET status = 'rejected' WHERE authority = ? AND status = 'submitted'", (authority,))
+        cur = conn.execute("UPDATE payments SET status = 'rejected' WHERE authority = ? AND status = 'submitted'", (authority,))
+        if cur.rowcount == 0:
+            return None
         row = conn.execute("SELECT * FROM payments WHERE authority = ?", (authority,)).fetchone()
         return dict(row) if row else None
+
 
 def get_payment(authority: str, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
     with get_conn(db_path) as conn:
         row = conn.execute("SELECT * FROM payments WHERE authority = ?", (authority,)).fetchone()
         return dict(row) if row else None
 
-def mark_payment_paid(authority: str, ref_id: str, expected_owner_id: Optional[int] = None, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def mark_payment_paid(authority: str, ref_id: str, expected_owner_id: Optional[int] = None, only_if_submitted: bool = False, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
     with get_conn(db_path) as conn:
         payment = conn.execute("SELECT * FROM payments WHERE authority = ?", (authority,)).fetchone()
         if not payment:
@@ -792,8 +817,18 @@ def mark_payment_paid(authority: str, ref_id: str, expected_owner_id: Optional[i
         owner_id = plan["owner_id"]
         if expected_owner_id is not None and owner_id != expected_owner_id:
             return None
-        if payment["status"] == "paid":
-            return payment
+
+        allowed = ("submitted",) if only_if_submitted else ("initiated", "submitted")
+        if payment["status"] not in allowed:
+            return None
+
+        placeholders = ",".join("?" for _ in allowed)
+        cur = conn.execute(
+            f"UPDATE payments SET status = 'paid', ref_id = ? WHERE authority = ? AND status IN ({placeholders})",
+            (ref_id, authority, *allowed)
+        )
+        if cur.rowcount == 0:
+            return None
 
         ensure_admin_account(owner_id, db_path=db_path)
         now = int(time.time())
@@ -805,7 +840,6 @@ def mark_payment_paid(authority: str, ref_id: str, expected_owner_id: Optional[i
         base_time = max(now, existing["expires_at"]) if existing and existing["expires_at"] > now else now
         new_expiry = base_time + duration_sec
 
-        conn.execute("UPDATE payments SET status = 'paid', ref_id = ? WHERE authority = ?", (ref_id, authority))
         conn.execute(
             """INSERT INTO subscriptions (user_id, chat_id, plan_id, expires_at, reminded, status)
                VALUES (?, ?, ?, ?, 0, 'active')
@@ -833,6 +867,7 @@ def mark_payment_paid(authority: str, ref_id: str, expected_owner_id: Optional[i
         updated["owner_id"] = owner_id
         updated["channel_title"] = plan["channel_title"]
         return updated
+
 
 def is_subscription_active(user_id: int, any_chat_id: int, db_path: Optional[str] = None) -> bool:
     now = int(time.time())
